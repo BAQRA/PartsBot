@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="ka">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ავტონაწილების ასისტენტი</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="chat">
+    <header class="chat__header">
+      <div class="chat__avatar">🚗</div>
+      <div class="chat__titles">
+        <h1 class="chat__title">ავტონაწილების ასისტენტი</h1>
+        <span class="chat__subtitle">ონლაინ • პასუხობს მაშინვე</span>
+      </div>
+    </header>
+
+    <main id="messages" class="chat__messages" aria-live="polite"></main>
+
+    <form id="composer" class="chat__composer" autocomplete="off">
+      <input
+        id="input"
+        class="chat__input"
+        type="text"
+        placeholder="დაწერეთ შეტყობინება…"
+        aria-label="შეტყობინება"
+      />
+      <button id="send" class="chat__send" type="submit" aria-label="გაგზავნა">➤</button>
+    </form>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
