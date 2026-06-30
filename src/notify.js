@@ -17,12 +17,19 @@
  * Uses global fetch (Node 18+). No new dependencies.
  */
 
-/** Build the Georgian notification text, omitting lines whose value is null/empty. */
+/**
+ * Build the Georgian notification text, omitting lines whose value is null/empty.
+ * A Messenger-sourced lead also carries senderName + senderId (merged in by
+ * messenger.js); those add the "კლიენტი (Messenger)" line and a chat deep-link so
+ * staff can find and reply to the conversation. Leads from /chat carry neither,
+ * so those lines are simply omitted.
+ */
 function formatLead(lead) {
   const rows = [
     ['ნაწილი', lead.part],
     ['მანქანა', lead.car],
     ['კლიენტი', lead.customer_name],
+    ['კლიენტი (Messenger)', lead.senderName],
     ['კონტაქტი', lead.contact],
     ['შენიშვნა', lead.note],
   ];
@@ -31,6 +38,10 @@ function formatLead(lead) {
     if (value != null && String(value).trim() !== '') {
       lines.push(`${label}: ${value}`);
     }
+  }
+  // Deep-link back to the Messenger conversation, when we have the sender's PSID.
+  if (lead.senderId != null && String(lead.senderId).trim() !== '') {
+    lines.push(`ჩატის ბმული: https://www.facebook.com/messages/t/${lead.senderId}`);
   }
   return lines.join('\n');
 }

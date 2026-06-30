@@ -26,6 +26,7 @@ const crypto = require('crypto');
 
 const { answerCustomer } = require('./brain');
 const { sendLead } = require('./notify');
+const { createLeadTracker } = require('./leaddedup');
 
 // Graph API version for the Send API endpoint.
 const GRAPH_API_VERSION = 'v21.0';
@@ -37,6 +38,11 @@ const MAX_HISTORY_MESSAGES = 20;
 // Per-sender conversation history: senderId -> [{ role, content }, ...].
 // In-memory only (resets on restart), which is fine for an MVP.
 const conversations = new Map();
+
+// Per-sender lead de-dup state (same Map-style, in-memory, keyed by PSID). The
+// brain emits a lead on every turn once it can; this ensures one conversation
+// produces at most one notification plus updates only on material change.
+const leadTracker = createLeadTracker();
 
 /**
  * express.json `verify` callback. Stashes the raw request bytes on req.rawBody
@@ -101,6 +107,35 @@ async function callSendAPI(senderId, text) {
 }
 
 /**
+ * Look up the customer's name from the Graph API for the lead notification.
+ * Best-effort: returns the name string, or null on any problem (missing token,
+ * non-OK response, network error). NEVER throws — a failed lookup must not block
+ * or break anything; the lead is just sent without a name.
+ */
+async function fetchSenderName(senderId) {
+  const token = process.env.PAGE_ACCESS_TOKEN;
+  if (!token) return null;
+
+  try {
+    const url = `https://graph.facebook.com/${senderId}?fields=first_name,last_name&access_token=${encodeURIComponent(
+      token
+    )}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.error(`[messenger] Profile lookup error ${res.status}: ${body}`);
+      return null;
+    }
+    const data = await res.json().catch(() => null);
+    const name = data ? [data.first_name, data.last_name].filter(Boolean).join(' ').trim() : '';
+    return name || null;
+  } catch (err) {
+    console.error('[messenger] Profile lookup failed:', err.message);
+    return null;
+  }
+}
+
+/**
  * Handle a single inbound text message: append it to the sender's history, ask
  * the brain for a reply (+ optional lead), store the reply, send it back, and
  * push any lead to the team. answerCustomer never throws (it returns a Georgian
@@ -121,9 +156,23 @@ async function handleTextMessage(senderId, text, parts) {
 
   await callSendAPI(senderId, reply);
 
-  // Notify the team of a lead AFTER the customer reply is sent, so a Telegram
-  // failure can't block or delay it. sendLead never throws.
-  if (lead) sendLead(lead);
+  // Notify the team of a lead AFTER the customer reply is sent, so neither the
+  // name lookup nor Telegram can block or delay it. Both are wrapped and never
+  // throw. De-dup FIRST: the brain emits a lead every turn, but staff should get
+  // at most one notification per conversation plus updates only when the
+  // meaningful content (part/car/contact) actually changes. `register` returns
+  // the merged, most-complete lead to send, or null when it's a duplicate.
+  if (lead) {
+    const toSend = leadTracker.register(senderId, lead);
+    if (toSend) {
+      // We merge Messenger source info (PSID, name, source) into the lead — the
+      // brain stays unaware of all this — so staff can jump straight to the chat.
+      const senderName = await fetchSenderName(senderId);
+      sendLead({ ...toSend, senderId, senderName, source: 'messenger' });
+    } else {
+      console.log('[messenger] Duplicate lead suppressed (no material change).');
+    }
+  }
 }
 
 /**
