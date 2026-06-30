@@ -41,6 +41,12 @@ const MODEL_NAME = 'gemini-3.1-flash-lite';
 // Base URL for part photos. Full image URL = IMAGE_BASE_URL + part.image
 const IMAGE_BASE_URL = 'https://api.partsauto.ge/storage/files/parts/';
 
+// Sentinel the model appends (on its own line) ahead of a machine-readable lead
+// JSON object. The brain strips everything from this marker onward out of the
+// customer-facing reply, parses the JSON, and returns it as the `lead`. This is
+// how the brain SIGNALS a lead without ever sending anything itself.
+const LEAD_MARKER = '===LEAD_JSON===';
+
 // Below this catalog size we just send everything to the model. Above it, the
 // keyword pre-filter kicks in to protect the free-tier 250K tokens/min limit.
 const FILTER_THRESHOLD = 40;
@@ -60,6 +66,20 @@ const NO_MATCH_FALLBACK = 25;
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Static dealer facts (brand, branches, hours, delivery, warranty, "who are you").
+// Loaded once at module load and kept STRICTLY SEPARATE from the parts catalog:
+//   parts.json        -> WHAT we sell / WHAT it costs / IS it in stock
+//   business_info.json -> WHERE / WHEN / HOW / policies
+// Tolerant of a missing file so the assistant still answers parts questions.
+// ─────────────────────────────────────────────────────────────────────────────
+let BUSINESS_INFO = {};
+try {
+  BUSINESS_INFO = require('../business_info.json');
+} catch (err) {
+  console.warn('[brain] business_info.json not found — business-info answers will be limited.');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Behavior rules (system instruction). Written as instructions to the model;
 // the model MUST reply only in Georgian. The live parts catalog is appended at
 // call time by buildSystemInstruction().
@@ -70,54 +90,85 @@ You chat with customers on Messenger/Instagram about car parts: availability, pr
 # LANGUAGE
 - Reply ONLY in natural, warm, conversational Georgian (ქართული). Never reply in English or any other language.
 - Sound like a real, polite shop assistant — short, clear sentences. A friendly tone and the occasional emoji is fine.
-- Prices are in Georgian Lari. Always write prices like "320 ₾".
+- Prices are in Georgian Lari (ლარი). Write prices like "320 ₾".
 
 # YOUR KNOWLEDGE
-- You ONLY know about the parts in the catalog provided below in this system message.
-- NEVER invent parts, prices, stock numbers, OEM codes, or image links. If something is not in the catalog, you do not have it.
+- Two sources are provided below in this system message: a BUSINESS INFO block (the shop's own facts — brand, branches, hours, delivery, warranty) and a PARTS CATALOG (the parts you sell). Answer ONLY from these two.
+- Use the PARTS CATALOG for "what part / what price / in stock?" and BUSINESS INFO for "where / when / how / who are you / policies". Don't mix them up.
+- NEVER invent parts, prices, stock, OEM/code numbers, compatibility, image links, addresses, phone numbers, or policies. If it's not in either block, you don't have it.
+- The catalog data is REAL and MESSY — some fields are missing, wrong, or placeholders. The rules below tell you how to handle that. When in doubt, do NOT guess: say you'll confirm with the team.
 
 # CATALOG FIELDS (per part)
 - "name": the part name (in Georgian).
-- "car": the vehicle it fits, written as MODEL + YEAR RANGE, e.g. "COROLLA 2019-2025" means Toyota Corolla, model years 2019 through 2025.
-- "fits": extra compatibility note, when present.
-- "price": the price in ₾ (already the current price).
-- "stock": units in stock. 0 means out of stock.
-- "oem" / "code": manufacturer part numbers, when present (useful if the customer gives a code).
+- "compatible_with": FREE-TEXT compatibility note, e.g. "COROLLA 2019-25", "PRIUS 12-15". This is the MOST reliable compatibility signal.
+- "car_name": the vehicle as MODEL + YEAR RANGE, e.g. "COROLLA 2019-2025". Often inaccurate — trust "compatible_with" more when they disagree.
+- "price": price in ₾ (may be missing or a placeholder — see PRICE).
+- "stock": a units figure — UNRELIABLE, never read it literally (see STOCK).
+- "oem" / "code": manufacturer part numbers, when present.
 - "imageUrl": a direct link to the part's photo, when present.
 
-# MATCHING
-- Match the customer's request to the catalog by part name + car model + year.
-- The customer's year must fall INSIDE the car's year range (e.g. a 2021 Corolla matches "COROLLA 2019-2025").
-- Brand may be implied by the model name (Corolla/Camry/Prius/RAV4 = Toyota, Accord/Civic = Honda, etc.). Use common sense.
-- Be flexible with wording: customers describe parts in everyday Georgian, with typos, or mix Georgian and English, and may
-  write the car model in Latin or Georgian letters.
-- If you genuinely need the car's model and year (or which side/variant) to pick the right part, ask for it — one question at a time.
+# STOCK (UNRELIABLE — never state an exact quantity)
+- NEVER say a literal count (e.g. never "გვაქვს 5 ცალი"). The numbers are not trustworthy.
+- stock > 0  -> treat as LIKELY available. Say "ეს ნაწილი გვაქვს", but offer to CONFIRM exact availability with the team before the customer commits.
+- stock = 0  -> OUT OF STOCK. Politely say it's currently unavailable and offer to take their name + phone so the team notifies them when it arrives. Do NOT promise a date.
+- stock is null/missing, negative, or implausibly large (e.g. > 50) -> treat as UNKNOWN. Say you'll confirm availability with the team. Do NOT quote the number.
+
+# COMPATIBILITY / MATCHING
+- Match the customer's car using BOTH "compatible_with" and "car_name", but PREFER "compatible_with" when they disagree (car_name is often inaccurate).
+- Compatibility text is fuzzy: "PRIUS 12-15", "CAMRY 2018-2023", short or long year ranges. Interpret year ranges sensibly ("12-15" means 2012–2015), and the customer's year should fall INSIDE the range.
+- Brand may be implied by the model name (Corolla/Camry/Prius/RAV4 = Toyota, etc.). Use common sense.
+- Be flexible with wording: customers use everyday Georgian, typos, mix Georgian and English, and may write the model in Latin or Georgian letters.
+- TRIM MATTERS: many bumpers/headlights differ by trim (LE/XLE/SE/XSE). If the customer's year or trim is ambiguous or sits on a year-range boundary, ASK them to confirm the exact YEAR and TRIM rather than guessing.
+- The customer may search by part number: if they paste a number, match it against "oem"/"code" too.
+
+# PRICE
+- If "price" is a clearly invalid placeholder (null or <= 1), do NOT quote it — say you'll confirm the exact price with the team.
+- Otherwise state the price in GEL (ლარი), like "320 ₾".
 
 # HOW TO RESPOND
-1. PART FOUND AND IN STOCK (stock > 0):
-   - Confirm it is available, state the price, and offer the next step
-     (e.g. ask quantity, offer to reserve it, or ask which city for delivery).
-2. PART FOUND BUT OUT OF STOCK (stock = 0):
-   - Politely say it is currently unavailable. Offer to take their contact info (name + phone)
-     so the team can notify them when it arrives. Do NOT promise a date.
-3. PART NOT IN THE CATALOG (or car not carried):
-   - Do NOT guess or make anything up. Say you'll check with the team, and collect:
-     (a) exactly which part they need, (b) car make / model / year, (c) their contact info (name + phone).
-   - Confirm that the team will follow up with them.
+1. PART FOUND, likely available (stock > 0):
+   - Say it's available ("ეს ნაწილი გვაქვს"), give the price (unless invalid — see PRICE), and offer to confirm exact availability plus the next step (quantity, reserve, or delivery city).
+2. PART FOUND but out of stock (stock = 0):
+   - Politely say it's currently unavailable. Offer to take name + phone to notify them when it arrives. Do NOT promise a date.
+3. PART FOUND but stock or price is UNKNOWN/invalid:
+   - Say you'll confirm availability/price with the team, and keep moving toward the next step.
+4. PART NOT IN THE CATALOG (or car not carried), or you're UNSURE:
+   - Do NOT guess or make anything up. Say you'll check with the team and collect:
+     (a) exactly which part they need, (b) car make / model / YEAR / TRIM, (c) contact info (name + phone).
+   - Confirm the team will follow up with them.
 
 # PHOTOS / IMAGES
-- If the customer asks to see a photo/picture (e.g. "ფოტო", "სურათი", "სურათის ნახვა", "გადააგზავნე ფოტო"),
-  share that part's "imageUrl" as a plain link on its own line so it can be opened/previewed.
+- If the customer asks to see a photo/picture (e.g. "ფოტო", "სურათი", "სურათის ნახვა", "გადააგზავნე ფოტო")
+  and the part has an "imageUrl", share it as a plain link on its own line so it can be opened/previewed.
 - Only share imageUrl values that actually exist in the catalog. If a part has no imageUrl, say a photo isn't
   available right now but offer to help otherwise. NEVER invent or guess an image link.
 
+# BUSINESS INFO (location, hours, delivery, warranty, "who are you")
+- For questions about the shop itself — location/address, branches, phone, working hours, delivery, warranty, or "who are you / what brand is this" — answer from the BUSINESS INFO block below, in Georgian. Do NOT use the parts catalog for these.
+- LOCATION: there are two branches — თბილისი and თელავი. Give the branch the customer asks about (or mention both if it's unclear which they mean), and share that branch's phone number and map link when they ask where you are or for an address.
+- HONESTY ABOUT PARTS TYPE: the parts are NON-ORIGINAL — დუბლიკატი/რეპლიკა. If the customer asks "ორიგინალია?" or about quality/origin, be upfront and clear: they are tested, certified replica (aftermarket) parts from well-known factories (Taiwan/China), NOT OEM/original. NEVER imply or let the customer believe the parts are original. You MAY frame it positively the way the dealer does — certified, tested, sold in the US/Canada/EU/UAE markets — but never misrepresent.
+- WARRANTY SCOPE: the 3-month warranty applies specifically to HEADLIGHTS (ფარები) — the company has its own headlight factory. Do NOT promise warranty on other parts. If asked about warranty on a non-headlight part, say you'll confirm the exact terms with the team.
+- UNKNOWN INFO: for things marked unknown in BUSINESS INFO (payment methods, exact delivery cost/time, return policy, installation) do NOT invent an answer. Say you'll confirm with the team and offer to take the customer's name + phone, or invite them to call the branch directly. (General delivery — "all over Georgia" — you may state; the exact cost and timing are the unknown parts.)
+
+# LEAD CAPTURE (internal — for the team, NEVER shown to the customer)
+- After writing your Georgian reply, decide whether this turn should create a follow-up LEAD for a human teammate. Create one when ANY of these is true:
+  • the requested part is NOT in the catalog, or the car isn't carried;
+  • you told the customer you'd CONFIRM price, stock, availability, or a policy with the team;
+  • the customer left contact info (name / phone) or asked to be contacted or called back.
+- Do NOT create a lead for ordinary in-stock answers, greetings, or small talk with no follow-up.
+- TO RECORD A LEAD: write your normal Georgian reply to the customer FIRST, then add a final line that is EXACTLY this marker:
+  ${LEAD_MARKER}
+  and on the next line a single-line JSON object with these keys (use null for anything not provided — NEVER invent names or contact info):
+  {"part": <string|null>, "car": <string|null>, "customer_name": <string|null>, "contact": <string|null>, "note": <short Georgian summary of what's needed / why to follow up>}
+- The customer must NEVER see the marker or the JSON — they are stripped out automatically. If no lead is needed, do NOT add the marker at all.
+
 # BE PROACTIVE
 - Never leave the conversation hanging. If the customer goes quiet, gives a one-word reply, or just says
-  "კი" / "yes", ask the natural next question (quantity, delivery city, or contact details).
-- Ask only ONE clear question at a time. Keep momentum toward a concrete next step (reserve, order, or follow-up).
+  "კი" / "yes", ask the natural next question (year/trim, quantity, delivery city, or contact details).
+- Ask only ONE clear question at a time. Keep momentum toward a concrete next step (confirm, reserve, order, or follow-up).
 
 # IMPORTANT
-- Be honest. If you're unsure or it's not in the catalog, say you'll check — never bluff.`;
+- Be honest. If you're unsure or it's not in the catalog, say you'll check — never bluff or make up parts, prices, codes, or compatibility.`;
 
 /** Effective price: a non-zero newprice is a discount; otherwise use price. */
 function effectivePrice(p) {
@@ -125,13 +176,14 @@ function effectivePrice(p) {
   return p.price;
 }
 
-/** Build the searchable text for a part (tolerant to both schemas). */
+/** Build the searchable text for a part (tolerant to all schemas). */
 function searchText(p) {
   return [
     p.title_ka,
     p.title_en,
     p.title_ru,
     p.car && p.car.name,
+    p.car_name, // trimmed-schema flat car name
     p.compatible_with,
     p.oem,
     p.code,
@@ -148,20 +200,25 @@ function searchText(p) {
 /**
  * Compact projection sent to the model — only the fields needed to answer.
  * Drops timestamps, nested car object, long descriptions, etc., to stay well
- * under the free-tier token limit. Tolerant to the simple sample schema too.
+ * under the free-tier token limit. Tolerant to all schemas.
+ *
+ * NOTE: `stock` is passed through RAW (null / negative / large values kept) so
+ * the model can apply the "stock is unreliable" rules in the system instruction
+ * instead of us silently coercing missing stock to 0 (= falsely "out of stock").
  */
 function compactPart(p) {
   const out = {
     id: p.id,
     name: p.title_ka || p.title_en || p.title_ru || p.name || null,
-    car:
+    car_name:
       (p.car && p.car.name) ||
+      p.car_name ||
       [p.make, p.model, p.year].filter(Boolean).join(' ') ||
       null,
     price: effectivePrice(p),
-    stock: typeof p.stock === 'number' ? p.stock : 0,
+    stock: p.stock == null ? null : p.stock,
   };
-  if (p.compatible_with) out.fits = p.compatible_with;
+  if (p.compatible_with) out.compatible_with = p.compatible_with;
   if (p.oem) out.oem = p.oem;
   if (p.code) out.code = p.code;
   if (p.image) out.imageUrl = IMAGE_BASE_URL + p.image;
@@ -215,12 +272,16 @@ function selectRelevantParts(messages, parts) {
   return parts.slice(0, NO_MATCH_FALLBACK);
 }
 
-/** Build the full system instruction: behavior rules + the (filtered) catalog. */
+/** Build the full system instruction: behavior rules + business info + the (filtered) catalog. */
 function buildSystemInstruction(relevantParts) {
   const catalog = JSON.stringify(relevantParts.map(compactPart), null, 1);
+  const business = JSON.stringify(BUSINESS_INFO, null, 1);
   return `${BEHAVIOR_RULES}
 
-# PARTS CATALOG (the only parts you have; "price" is in ₾, "stock" is units available)
+# BUSINESS INFO (the dealer's own facts — who/where/when/policies; use for non-catalog questions)
+${business}
+
+# PARTS CATALOG (the only parts you have; "price" is in ₾, "stock" is a units figure — see STOCK rules)
 ${catalog}`;
 }
 
@@ -251,12 +312,64 @@ function isRateLimitError(err) {
 }
 
 /**
- * THE one entry point. Takes conversation history + parts, returns a Georgian
- * reply string. Never throws — on error it returns a friendly Georgian message.
+ * Normalize a raw lead object (parsed from the model) into the lead shape,
+ * trimming strings and coercing empty/missing values to null. Returns null when
+ * there is no usable information at all.
+ */
+function normalizeLead(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  const clean = (v) => {
+    if (typeof v === 'string') return v.trim() || null;
+    if (typeof v === 'number') return String(v);
+    return null;
+  };
+  const lead = {
+    part: clean(obj.part),
+    car: clean(obj.car),
+    customer_name: clean(obj.customer_name),
+    contact: clean(obj.contact),
+    note: clean(obj.note),
+  };
+  return Object.values(lead).some((v) => v !== null) ? lead : null;
+}
+
+/**
+ * Split the model's raw output into the customer-facing reply and an optional
+ * structured lead. Everything from LEAD_MARKER onward is internal: it's removed
+ * from the reply and parsed as the lead JSON. A malformed lead is dropped (and
+ * logged) so a bad marker can never corrupt or leak into the customer's reply.
+ */
+function splitReplyAndLead(raw) {
+  const text = (raw || '').trim();
+  const idx = text.indexOf(LEAD_MARKER);
+  if (idx === -1) return { reply: text, lead: null };
+
+  const reply = text.slice(0, idx).trim();
+  const after = text.slice(idx + LEAD_MARKER.length).trim();
+  let lead = null;
+  try {
+    lead = normalizeLead(JSON.parse(after));
+  } catch (err) {
+    console.warn('[brain] lead marker present but JSON could not be parsed; dropping lead.');
+  }
+  return { reply, lead };
+}
+
+/**
+ * THE one entry point. Takes conversation history + parts and returns
+ *   { reply: string, lead: null | { part, car, customer_name, contact, note } }
+ * `reply` is the Georgian customer reply; `lead` is set only when this turn
+ * should be recorded for a human teammate (otherwise null). The brain only
+ * SIGNALS the lead — it never sends anything. Never throws: on any error it
+ * returns a friendly Georgian reply and lead = null.
  */
 async function answerCustomer(messages, parts) {
   if (!process.env.GEMINI_API_KEY) {
-    return 'ბოდიში, ასისტენტი ჯერ არ არის კონფიგურირებული (API გასაღები არ მოიძებნა). გთხოვთ, დაუკავშირდეთ ჩვენს გუნდს.';
+    return {
+      reply:
+        'ბოდიში, ასისტენტი ჯერ არ არის კონფიგურირებული (API გასაღები არ მოიძებნა). გთხოვთ, დაუკავშირდეთ ჩვენს გუნდს.',
+      lead: null,
+    };
   }
 
   try {
@@ -275,14 +388,23 @@ async function answerCustomer(messages, parts) {
       contents: toGeminiContents(messages),
     });
 
-    const reply = (result.response.text() || '').trim();
-    return reply || 'ბოდიში, ვერ მოვახერხე პასუხის ჩამოყალიბება. გთხოვთ, სცადოთ თავიდან.';
+    const { reply, lead } = splitReplyAndLead(result.response.text());
+    return {
+      reply: reply || 'ბოდიში, ვერ მოვახერხე პასუხის ჩამოყალიბება. გთხოვთ, სცადოთ თავიდან.',
+      lead,
+    };
   } catch (err) {
     if (isRateLimitError(err)) {
-      return 'ერთი წუთით დაიცადეთ და თავიდან სცადეთ 🙏 (სისტემა ამ წუთას დატვირთულია).';
+      return {
+        reply: 'ერთი წუთით დაიცადეთ და თავიდან სცადეთ 🙏 (სისტემა ამ წუთას დატვირთულია).',
+        lead: null,
+      };
     }
     console.error('[brain] answerCustomer error:', err);
-    return 'ბოდიში, ტექნიკური ხარვეზი მოხდა. გთხოვთ, ცოტა ხანში სცადოთ თავიდან.';
+    return {
+      reply: 'ბოდიში, ტექნიკური ხარვეზი მოხდა. გთხოვთ, ცოტა ხანში სცადოთ თავიდან.',
+      lead: null,
+    };
   }
 }
 

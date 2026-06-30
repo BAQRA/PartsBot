@@ -25,6 +25,7 @@
 const crypto = require('crypto');
 
 const { answerCustomer } = require('./brain');
+const { sendLead } = require('./notify');
 
 // Graph API version for the Send API endpoint.
 const GRAPH_API_VERSION = 'v21.0';
@@ -101,14 +102,15 @@ async function callSendAPI(senderId, text) {
 
 /**
  * Handle a single inbound text message: append it to the sender's history, ask
- * the brain for a reply, store the reply, and send it back. answerCustomer never
- * throws (it returns a Georgian fallback on error), so the reply is always sent.
+ * the brain for a reply (+ optional lead), store the reply, send it back, and
+ * push any lead to the team. answerCustomer never throws (it returns a Georgian
+ * fallback on error), so the reply is always sent.
  */
 async function handleTextMessage(senderId, text, parts) {
   const history = conversations.get(senderId) || [];
   history.push({ role: 'user', content: text });
 
-  const reply = await answerCustomer(history, parts);
+  const { reply, lead } = await answerCustomer(history, parts);
 
   history.push({ role: 'assistant', content: reply });
   // Trim to the most recent turns to bound memory use.
@@ -118,6 +120,10 @@ async function handleTextMessage(senderId, text, parts) {
   conversations.set(senderId, history);
 
   await callSendAPI(senderId, reply);
+
+  // Notify the team of a lead AFTER the customer reply is sent, so a Telegram
+  // failure can't block or delay it. sendLead never throws.
+  if (lead) sendLead(lead);
 }
 
 /**

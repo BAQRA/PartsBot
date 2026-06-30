@@ -16,6 +16,7 @@ const express = require('express');
 
 const { answerCustomer, MODEL_NAME } = require('./brain');
 const { mountMessenger, rawBodySaver } = require('./messenger');
+const { sendLead } = require('./notify');
 
 const PORT = process.env.PORT || 3000;
 const PARTS_PATH = path.join(__dirname, '..', 'parts.json');
@@ -63,8 +64,12 @@ app.post('/chat', async (req, res) => {
     return res.status(400).json({ error: 'Request body must include a "messages" array.' });
   }
 
-  const reply = await answerCustomer(messages, parts);
+  const { reply, lead } = await answerCustomer(messages, parts);
   res.json({ reply });
+
+  // Push the lead to the team AFTER replying, so the notification can never delay
+  // or block the customer's response. sendLead is self-contained and never throws.
+  if (lead) sendLead(lead);
 });
 
 app.listen(PORT, () => {
