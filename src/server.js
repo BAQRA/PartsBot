@@ -15,6 +15,7 @@ const fs = require('fs');
 const express = require('express');
 
 const { answerCustomer, MODEL_NAME } = require('./brain');
+const { mountMessenger, rawBodySaver } = require('./messenger');
 
 const PORT = process.env.PORT || 3000;
 const PARTS_PATH = path.join(__dirname, '..', 'parts.json');
@@ -34,9 +35,25 @@ if (!process.env.GEMINI_API_KEY) {
   console.warn('[server] WARNING: GEMINI_API_KEY is not set. Copy .env.example to .env and add your key.');
 }
 
+const missingMessengerVars = ['VERIFY_TOKEN', 'PAGE_ACCESS_TOKEN', 'APP_SECRET'].filter(
+  (v) => !process.env[v]
+);
+if (missingMessengerVars.length) {
+  console.warn(
+    `[server] WARNING: Messenger webhook env vars not set: ${missingMessengerVars.join(', ')}. ` +
+      'The /webhook routes will load but verification/replies will fail until these are configured.'
+  );
+}
+
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+// `verify` stashes the raw request bytes on req.rawBody so the Messenger webhook
+// can validate Meta's X-Hub-Signature-256 over exactly the bytes that were signed.
+app.use(express.json({ limit: '1mb', verify: rawBodySaver }));
 app.use(express.static(PUBLIC_DIR));
+
+// Mount the Facebook/Instagram Messenger interface (GET/POST /webhook). Like
+// /chat below, it's just another thin interface around the same brain.
+mountMessenger(app, parts);
 
 // POST /chat — the only dynamic endpoint. Body: { messages: [{role, content}, ...] }
 app.post('/chat', async (req, res) => {
